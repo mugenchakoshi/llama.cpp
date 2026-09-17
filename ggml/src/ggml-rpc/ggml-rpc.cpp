@@ -5,6 +5,7 @@
 #include "transport.h"
 
 #include <array>
+#include <chrono>
 #include <cinttypes>
 #include <optional>
 #include <string>
@@ -19,6 +20,10 @@
 #include <algorithm>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+// GGML_RPC_PROFILE enables per-node graph profiling: each node's op, tensor name and
+// wall-clock time is appended as a CSV row to RPC_PROFILE_CSV_PATH.
+static const char * RPC_PROFILE = std::getenv("GGML_RPC_PROFILE");
+static constexpr const char * RPC_PROFILE_CSV_PATH = "/tmp/rpc-profile.csv";
 
 #define LOG_DBG(...) \
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
@@ -1320,6 +1325,67 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
     return result;
 }
 
+// only used when GGML_RPC_PROFILE is set: lazily opens the CSV file (appending, with a
+// header written only the first time) and keeps it open for the life of the process. The
+// server handles one client at a time (see the accept loop below), so no locking is needed.
+static std::ofstream & rpc_profile_csv_stream() {
+    static std::ofstream csv_out;
+    static bool initialized = false;
+    if (!initialized) {
+        initialized = true;
+        const bool have_header = fs::exists(RPC_PROFILE_CSV_PATH) && fs::file_size(RPC_PROFILE_CSV_PATH) > 0;
+        csv_out.open(RPC_PROFILE_CSV_PATH, std::ios::app);
+        if (!have_header) {
+            csv_out << "call,device,caller,node,n_nodes,op,name,"
+                        "src0_ne0,src0_ne1,src0_ne2,src0_ne3,"
+                        "src1_ne0,src1_ne1,src1_ne2,src1_ne3,"
+                        "dst_ne0,dst_ne1,dst_ne2,dst_ne3,elapsed_us\n";
+        }
+    }
+    return csv_out;
+}
+
+// writes a tensor's 4 dimensions as CSV fields, or four 0s if the tensor doesn't exist
+// (e.g. a unary op's absent src[1])
+static std::ofstream & rpc_profile_csv_write_ne(std::ofstream & out, const ggml_tensor * t) {
+    for (int d = 0; d < GGML_MAX_DIMS; d++) {
+        out << (t ? t->ne[d] : 0) << ',';
+    }
+    return out;
+}
+
+// only used when GGML_RPC_PROFILE is set: runs the graph one node at a time so each
+// node's op and wall-clock time can be recorded; not used on the default (unprofiled) path
+static ggml_status rpc_profiled_graph_compute(ggml_backend_t backend, ggml_cgraph * graph, uint32_t device, const char * caller) {
+    static uint64_t next_call_id = 0;
+    const uint64_t call_id = next_call_id++;
+    const auto t_start = std::chrono::high_resolution_clock::now();
+    ggml_status status = GGML_STATUS_SUCCESS;
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const ggml_tensor * node = graph->nodes[i];
+        ggml_cgraph view = ggml_graph_view(graph, i, i + 1);
+        const auto n_start = std::chrono::high_resolution_clock::now();
+        status = ggml_backend_graph_compute(backend, &view);
+        const auto n_end = std::chrono::high_resolution_clock::now();
+        if (status != GGML_STATUS_SUCCESS) {
+            break;
+        }
+        const double node_us = std::chrono::duration<double, std::micro>(n_end - n_start).count();
+        std::ofstream & csv = rpc_profile_csv_stream();
+        csv << call_id << ',' << device << ',' << caller << ',' << i << ',' << graph->n_nodes
+            << ',' << ggml_op_name(node->op) << ',' << node->name << ',';
+        rpc_profile_csv_write_ne(csv, node->src[0]);
+        rpc_profile_csv_write_ne(csv, node->src[1]);
+        rpc_profile_csv_write_ne(csv, node);
+        csv << node_us << '\n';
+    }
+    rpc_profile_csv_stream().flush();
+    const auto t_end = std::chrono::high_resolution_clock::now();
+    const double total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    GGML_LOG_INFO("[%s] device: %u, n_nodes: %d, total elapsed: %.2f ms\n", caller, device, graph->n_nodes, total_ms);
+    return status;
+}
+
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     // serialization format:
     // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
@@ -1384,7 +1450,9 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
     }
-    ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    ggml_status status = RPC_PROFILE
+        ? rpc_profiled_graph_compute(backends[device], graph, device, __func__)
+        : ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     stored_graphs[device].graph = graph;
     return true;
@@ -1400,7 +1468,9 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     }
     ggml_cgraph * graph = stored_graphs[device].graph;
     LOG_DBG("[%s] device: %u\n", __func__, device);
-    ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    ggml_status status = RPC_PROFILE
+        ? rpc_profiled_graph_compute(backends[device], graph, device, __func__)
+        : ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     return true;
 }

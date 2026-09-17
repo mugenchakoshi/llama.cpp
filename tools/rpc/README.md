@@ -108,3 +108,30 @@ Use the `GGML_RPC_DEBUG` environment variable to enable debug messages from `rpc
 $ GGML_RPC_DEBUG=1 bin/rpc-server
 ```
 
+Use the `GGML_RPC_PROFILE` environment variable to log the op, tensor name and wall-clock time
+of each graph node computed by `rpc-server`, appended as CSV rows to `/tmp/rpc-profile.csv`
+(one row per node, with a `call` column grouping the rows from the same
+`graph_compute`/`graph_recompute` call):
+```bash
+$ GGML_RPC_PROFILE=1 bin/rpc-server
+```
+```
+call,device,caller,node,n_nodes,op,name,src0_ne0,src0_ne1,src0_ne2,src0_ne3,src1_ne0,src1_ne1,src1_ne2,src1_ne3,dst_ne0,dst_ne1,dst_ne2,dst_ne3,elapsed_us
+0,0,graph_compute,2,873,MUL_MAT,Qcur-0,3072,3072,1,1,3072,16,1,1,3072,16,1,1,4242.6
+0,0,graph_compute,21,873,RESHAPE,kqv_out-0,128,24,16,1,0,0,0,0,3072,16,1,1,0.813
+...
+```
+`src0_ne*`/`src1_ne*` are the node's two source tensors' 4 dimensions (all 0 if a source
+doesn't apply, e.g. `src1` for a unary op like `RMS_NORM`) and `dst_ne*` are the node's own
+output dimensions -- e.g. for `MUL_MAT(a, b)`, `src0`/`src1` are `a`/`b` and `dst_ne` is the
+resulting `[a.ne1, b.ne1, b.ne2, b.ne3]` shape. Which dimension holds the batch/sequence length
+depends on the tensor's role in the graph -- e.g. above, `Qcur-0`'s `src1_ne1` (3072x**16**) and
+`kqv_out-0`'s `src0_ne2` (128x24x**16**) are both the same 16-token batch, just on different axes.
+The console log still prints one summary line per call:
+```
+[graph_compute] device: 0, n_nodes: 873, total elapsed: 24.88 ms
+```
+This runs each node as its own sub-graph to time it individually, so it adds noticeable overhead --
+only enable it while profiling, not for normal operation. The CSV file is appended to across the
+process's lifetime (a header is written only if the file doesn't already exist).
+
