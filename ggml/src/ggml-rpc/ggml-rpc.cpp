@@ -23,7 +23,7 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 // GGML_RPC_PROFILE enables per-node graph profiling: each node's op, tensor name and
 // wall-clock time is appended as a CSV row to RPC_PROFILE_CSV_PATH.
 static const char * RPC_PROFILE = std::getenv("GGML_RPC_PROFILE");
-static constexpr const char * RPC_PROFILE_CSV_PATH = "/tmp/rpc-profile.csv";
+static constexpr const char * RPC_PROFILE_CSV_PATH = "/home/ishii/rpc-profile.csv";
 
 #define LOG_DBG(...) \
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
