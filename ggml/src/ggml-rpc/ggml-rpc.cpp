@@ -7,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <optional>
 #include <string>
 #include <vector>
@@ -24,6 +25,9 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 // wall-clock time is appended as a CSV row to RPC_PROFILE_CSV_PATH.
 static const char * RPC_PROFILE = std::getenv("GGML_RPC_PROFILE");
 static constexpr const char * RPC_PROFILE_CSV_PATH = "/home/ishii/rpc-profile.csv";
+// once the CSV reaches this size the server shuts itself down, so a remote client sweep
+// doesn't need any way to check the file size on this machine to know when to stop
+static constexpr uint64_t RPC_PROFILE_CSV_MAX_BYTES = 100ULL * 1024 * 1024 * 1024; // 100GB
 
 #define LOG_DBG(...) \
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
@@ -1383,6 +1387,11 @@ static ggml_status rpc_profiled_graph_compute(ggml_backend_t backend, ggml_cgrap
     const auto t_end = std::chrono::high_resolution_clock::now();
     const double total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
     GGML_LOG_INFO("[%s] device: %u, n_nodes: %d, total elapsed: %.2f ms\n", caller, device, graph->n_nodes, total_ms);
+    if (fs::file_size(RPC_PROFILE_CSV_PATH) >= RPC_PROFILE_CSV_MAX_BYTES) {
+        GGML_LOG_INFO("[%s] %s reached %" PRIu64 " bytes -- shutting down\n",
+                       caller, RPC_PROFILE_CSV_PATH, RPC_PROFILE_CSV_MAX_BYTES);
+        std::exit(0);
+    }
     return status;
 }
 
